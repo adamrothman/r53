@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -10,45 +11,47 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/external"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/route53"
+	"github.com/aws/aws-sdk-go-v2/service/route53/types"
 	log "github.com/sirupsen/logrus"
 )
 
-const recordType = route53.RRTypeA
+const recordType = types.RRTypeA
 
 func getExternalIP() (string, error) {
 	res, err := http.Get("https://checkip.amazonaws.com/")
 	if err != nil {
-		return "", fmt.Errorf("sending request: %s", err)
+		return "", fmt.Errorf("sending request: %w", err)
 	}
 	defer res.Body.Close()
 
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return "", fmt.Errorf("reading response body: %s", err)
+		return "", fmt.Errorf("reading response body: %w", err)
 	}
 
 	return string(bytes.TrimSpace(body)), err
 }
 
-func getRegisteredIP(client *route53.Route53, hostedZone, recordName string) (*string, error) {
-	req := client.ListResourceRecordSetsRequest(&route53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(hostedZone),
-		StartRecordName: aws.String(recordName),
-		StartRecordType: recordType,
-	})
-
-	res, err := req.Send()
+func getRegisteredIP(client *route53.Client, ctx context.Context, hostedZone, recordName string) (*string, error) {
+	out, err := client.ListResourceRecordSets(
+		ctx,
+		&route53.ListResourceRecordSetsInput{
+			HostedZoneId:    aws.String(hostedZone),
+			StartRecordName: aws.String(recordName),
+			StartRecordType: recordType,
+		},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("sending AWS request: %s", err)
+		return nil, fmt.Errorf("sending AWS request: %w", err)
 	}
 
-	if len(res.ResourceRecordSets) == 0 {
+	if len(out.ResourceRecordSets) == 0 {
 		return nil, nil
 	}
 
-	recordSet := res.ResourceRecordSets[0]
+	recordSet := out.ResourceRecordSets[0]
 	if *recordSet.Name != recordName || recordSet.Type != recordType || len(recordSet.ResourceRecords) == 0 {
 		return nil, nil
 	}
@@ -56,34 +59,33 @@ func getRegisteredIP(client *route53.Route53, hostedZone, recordName string) (*s
 	return recordSet.ResourceRecords[0].Value, nil
 }
 
-func updateRecord(client *route53.Route53, hostedZone, recordName, ip string, ttl int64) error {
+func updateRecord(client *route53.Client, ctx context.Context, hostedZone, recordName, ip string, ttl int64) error {
 	comment := time.Now().Format(time.RFC3339Nano)
 
-	req := client.ChangeResourceRecordSetsRequest(&route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: &hostedZone,
-		ChangeBatch: &route53.ChangeBatch{
-			Comment: aws.String(comment),
-			Changes: []route53.Change{
-				route53.Change{
-					Action: route53.ChangeActionUpsert,
-					ResourceRecordSet: &route53.ResourceRecordSet{
-						Name: aws.String(recordName),
-						ResourceRecords: []route53.ResourceRecord{
-							route53.ResourceRecord{
-								Value: aws.String(ip),
+	_, err := client.ChangeResourceRecordSets(
+		ctx,
+		&route53.ChangeResourceRecordSetsInput{
+			HostedZoneId: &hostedZone,
+			ChangeBatch: &types.ChangeBatch{
+				Comment: aws.String(comment),
+				Changes: []types.Change{
+					{
+						Action: types.ChangeActionUpsert,
+						ResourceRecordSet: &types.ResourceRecordSet{
+							Name: aws.String(recordName),
+							ResourceRecords: []types.ResourceRecord{
+								{Value: aws.String(ip)},
 							},
+							TTL:  aws.Int64(ttl),
+							Type: recordType,
 						},
-						TTL:  aws.Int64(ttl),
-						Type: recordType,
 					},
 				},
 			},
 		},
-	})
-
-	_, err := req.Send()
+	)
 	if err != nil {
-		return fmt.Errorf("sending AWS request: %s", err)
+		return fmt.Errorf("sending AWS request: %w", err)
 	}
 
 	return nil
@@ -113,12 +115,14 @@ func main() {
 		"ttl":         ttl,
 	})
 
-	cfg, err := external.LoadDefaultAWSConfig()
+	ctx := context.Background()
+
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.WithError(err).Fatal("Error loading SDK config")
 	}
 
-	r53 := route53.New(cfg)
+	client := route53.NewFromConfig(cfg)
 
 	externalIP, err := getExternalIP()
 	if err != nil {
@@ -127,7 +131,7 @@ func main() {
 
 	log = log.WithField("ip", externalIP)
 
-	registeredIP, err := getRegisteredIP(r53, hostedZone, recordName)
+	registeredIP, err := getRegisteredIP(client, ctx, hostedZone, recordName)
 	if err != nil {
 		log.WithError(err).Fatal("Error getting registered IP")
 	}
@@ -137,7 +141,7 @@ func main() {
 		return
 	}
 
-	if err := updateRecord(r53, hostedZone, recordName, externalIP, ttl); err != nil {
+	if err := updateRecord(client, ctx, hostedZone, recordName, externalIP, ttl); err != nil {
 		log.WithError(err).Fatal("Error updating record")
 	} else {
 		log.Info("Record updated")
