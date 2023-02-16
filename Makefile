@@ -10,4 +10,4 @@ build-linux:
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $(BINARY)_$(GOOS)-$(GOARCH)
 
 clean:
-	-rm route53-updater*
+	-rm r53*
